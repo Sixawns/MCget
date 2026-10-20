@@ -97,7 +97,8 @@ class App(ctk.CTk):
         "ldver": "加载器的版本号。留空自动用最新的稳定版。",
         "auto_vanilla": "Fabric / Quilt 要靠原版文件才能跑。没下过原版时，勾上会自动把原版也下了。",
         "start": "开始下载。下过的文件会自动跳过，中途停了再点一次能接着下。",
-        "stop": "停下来。已经下好的文件都留着。",
+        "stop": "停下来。已经下好的文件都留着，没下完的版本不会出现在启动器里。",
+        "clean": "扫一遍有没有没下完的版本（比如中途取消留下的空文件夹），可以删掉。",
     }
     DEFAULT_HINT = "把鼠标停在任意选项上，这里会说明它是干什么的。"
 
@@ -254,7 +255,8 @@ class App(ctk.CTk):
                      (self.slider, "jobs"), (self.chk_extract, "extract"),
                      (self.opt_loader, "loader"), (self.entry_ld_mc, "ldmc"),
                      (self.entry_ld_ver, "ldver"), (self.chk_auto_vanilla, "auto_vanilla"),
-                     (self.btn_start, "start"), (self.btn_stop, "stop")):
+                     (self.btn_start, "start"), (self.btn_stop, "stop"),
+                     (self.btn_clean, "clean")):
             self._bind_hint(w, k)
 
         self.slider.set(16)
@@ -409,38 +411,53 @@ class App(ctk.CTk):
         def work():
             try:
                 found = mcget.find_incomplete_versions()
+                parts = mcget.find_part_files()
             except Exception as e:
                 self.q.put({"type": "log", "text": f"[异常] {e}"})
-                found = []
-            self.q.put({"type": "clean_found", "found": found})
+                found, parts = [], []
+            self.q.put({"type": "clean_found", "found": found, "parts": parts})
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_clean_found(self, found):
+    def _on_clean_found(self, found, parts=None):
+        parts = parts or []
         self.btn_clean.configure(state="normal")
-        if not found:
+        if not found and not parts:
             self._log("      没有残缺版本，目录是干净的")
             return
 
-        self._log(f"      发现 {len(found)} 个残缺版本：")
-        for name, reason in found:
-            self._log(f"        {name}  —— {reason}")
+        if found:
+            self._log(f"      发现 {len(found)} 个残缺版本：")
+            for name, reason in found:
+                self._log(f"        {name}  —— {reason}")
+        if parts:
+            self._log(f"      发现 {len(parts)} 个没写完的半成品")
+            for p in parts[:5]:
+                self._log(f"        {os.path.basename(p)}")
 
         # 弹窗确认再删，避免误伤
         listing = "\n".join(f"  · {n}（{r}）" for n, r in found[:12])
         if len(found) > 12:
             listing += f"\n  …… 还有 {len(found) - 12} 个"
+        if parts:
+            listing += f"\n  · {len(parts)} 个没写完的半成品文件"
+        has_files = any("残留文件" in r or "缺主 jar" in r for _, r in found)
+        extra = ("\n注意：其中有的目录里已经下了一部分文件，会一并删掉，"
+                 "重下时会重新下载。\n" if has_files else "")
+        total = len(found) + len(parts)
         ok = messagebox.askyesno(
             "清理残缺版本",
-            f"要删掉这 {len(found)} 个残缺版本吗？\n\n{listing}\n\n"
-            f"这些都是缺了主文件或依赖原版的版本，删掉不影响其他版本。\n"
+            f"要删掉这 {total} 项吗？\n\n{listing}\n"
+            f"{extra}\n"
+            f"这些都是没下完或缺了依赖的东西，删掉不影响已装好的版本。\n"
             f"要恢复的话重新下载一次即可。")
         if not ok:
             self._log("      已取消，没有删除任何东西")
             return
 
         removed, _ = mcget.cleanup_incomplete_versions(dry_run=False)
-        self._log(f"      已清理 {removed} 个残缺版本")
+        removed_parts, _ = mcget.cleanup_part_files(dry_run=False)
+        self._log(f"      已清理 {removed} 个残缺版本、{removed_parts} 个半成品")
 
     # ---- 统一后的加载器入口 ----
 
@@ -565,7 +582,7 @@ class App(ctk.CTk):
         elif t == "loader_list":
             self._on_loader_list(item.get("kind"), item.get("mc"), item.get("versions"))
         elif t == "clean_found":
-            self._on_clean_found(item.get("found") or [])
+            self._on_clean_found(item.get("found") or [], item.get("parts") or [])
         elif t == "finished":
             self._on_finished(item.get("rc", 0))
         # "tick" 不需要处理，_poll 里统一刷新
@@ -660,6 +677,18 @@ class App(ctk.CTk):
             pass
 
     def _on_close(self):
+        # 正在下载时直接关窗口会把工作线程一起带走：
+        # 已经下好的文件不受影响，但正在写的那个文件会留下个 .part 半成品。
+        # 所以先问一句，让「停止」有机会走优雅收尾那条路。
+        if self.busy:
+            ok = messagebox.askyesno(
+                "正在下载",
+                "下载还没结束，现在关闭的话会中断它。\n\n"
+                "已经下好的文件都会保留，下次接着下；\n"
+                "但正在写的那个文件会留下一个半成品，需要下次重下。\n\n"
+                "建议先点「停止」再关闭。确定要直接关吗？")
+            if not ok:
+                return
         self._save_config()
         mcget.request_cancel()
         self.destroy()

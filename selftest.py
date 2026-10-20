@@ -496,6 +496,85 @@ def main():
     check("完整下载后 version json 才出现",
           os.path.isfile(os.path.join(vdir, f"{VERSION_ID}.json")))
 
+    print("\n=== 取消后连空文件夹都不留 ===")
+    # fetch() 以前是「开工就建目录」，所以一取消就留下 versions/<id>/ 空壳。
+    # 现在改成写盘前才建，取消时应当一个目录都不会出现。
+    tmp3 = tempfile.mkdtemp(prefix="mcget_dir_")
+    mcget.GAME_DIR = os.path.join(tmp3, ".minecraft")
+    mcget.request_cancel()
+    mcget.stat.update({"downloaded": 0, "skipped": 0, "failed": 0})
+    run_download()
+    check("取消后版本目录根本没被创建",
+          not os.path.isdir(os.path.join(mcget.GAME_DIR, "versions", VERSION_ID)))
+    mcget.reset_cancel()
+
+    # 正常下完，目录和 json 都要在
+    mcget.stat.update({"downloaded": 0, "skipped": 0, "failed": 0})
+    run_download()
+    vd = os.path.join(mcget.GAME_DIR, "versions", VERSION_ID)
+    check("完整下载后目录与 json 都在",
+          os.path.isdir(vd) and os.path.isfile(os.path.join(vd, f"{VERSION_ID}.json")))
+
+    # 兜底清理：空目录能被删掉，有内容的绝不动
+    empty_id = "empty-shell"
+    edir = os.path.join(mcget.GAME_DIR, "versions", empty_id)
+    os.makedirs(edir, exist_ok=True)
+    check("空目录会被清掉", mcget.remove_empty_version_dir(empty_id) is True
+          and not os.path.isdir(edir))
+    check("有文件的目录不会被误删",
+          mcget.remove_empty_version_dir(VERSION_ID) is False
+          and os.path.isdir(vd))
+
+    shutil.rmtree(tmp3, ignore_errors=True)
+    mcget.GAME_DIR = os.path.join(tmp2, ".minecraft")
+
+    print("\n=== 原子写盘（关窗口 / 强杀进程也不留坏文件）===")
+    FULL_DATA = "完整内容".encode()
+    NEW_DATA = "新内容".encode()
+    PART_DATA = "只写了一半".encode()
+    tmp4 = tempfile.mkdtemp(prefix="mcget_atomic_")
+    target = os.path.join(tmp4, "sub", "client.jar")
+
+    # 正常写入：正式文件出现，不留 .part
+    mcget.atomic_write(target, FULL_DATA)
+    check("正常写入后正式文件存在", os.path.isfile(target))
+    check("正常写入后没有 .part 残留",
+          not os.path.isfile(target + ".part"))
+    check("写入内容正确", open(target, "rb").read() == FULL_DATA)
+
+    # 写盘失败：不留正式文件，.part 也被收干净
+    orig_replace = os.replace
+    os.replace = lambda a, b: (_ for _ in ()).throw(OSError("模拟写盘失败"))
+    try:
+        mcget.atomic_write(target, NEW_DATA)
+        raised = False
+    except OSError:
+        raised = True
+    finally:
+        os.replace = orig_replace
+    check("写盘失败会抛异常", raised)
+    check("写盘失败不留 .part 垃圾", not os.path.isfile(target + ".part"))
+    check("写盘失败时旧文件原封不动",
+          open(target, "rb").read() == FULL_DATA)
+
+    # 模拟「进程被强杀」留下的 .part：能被扫到、能被清掉
+    # （要放在 versions/ 这类子目录下，find_part_files 只扫这几个）
+    part = os.path.join(tmp4, "versions", "1.20.1", "client.jar.part")
+    os.makedirs(os.path.dirname(part), exist_ok=True)
+    with open(part, "wb") as f:
+        f.write(PART_DATA)
+    old_dir4 = mcget.GAME_DIR
+    mcget.GAME_DIR = tmp4
+    found_parts = mcget.find_part_files()
+    check("半成品 .part 能被扫描到", len(found_parts) == 1, f"实际 {found_parts}")
+    dry_parts, _ = mcget.cleanup_part_files(dry_run=True)
+    check("--dry-run 不删半成品", dry_parts == 0 and os.path.isfile(part))
+    n_parts, _ = mcget.cleanup_part_files(dry_run=False)
+    check("半成品能被清掉", n_parts == 1 and not os.path.isfile(part))
+    check("清完后再扫描是干净的", mcget.find_part_files() == [])
+    mcget.GAME_DIR = old_dir4
+    shutil.rmtree(tmp4, ignore_errors=True)
+
     print("\n=== 清理残缺版本 ===")
     # 手工造一个「有 json 但没 jar」的残缺版本，模拟老版本留下的烂摊子
     broken = "1.99.9-broken"
@@ -528,6 +607,28 @@ def main():
     check("缺依赖原版的加载器版本被识别",
           any(n == fab for n, _ in found2), f"实际 {found2}")
     mcget.cleanup_incomplete_versions(dry_run=False)
+
+    # 「有目录没 json」的空壳 —— 用户反馈的那种残留，必须能扫到也能删
+    shell = "1.98.7-shell"
+    sdir = os.path.join(mcget.GAME_DIR, "versions", shell)
+    os.makedirs(sdir, exist_ok=True)
+    found3 = mcget.find_incomplete_versions()
+    check("没 json 的空壳目录被识别",
+          any(n == shell and "空目录" in r for n, r in found3), f"实际 {found3}")
+    mcget.cleanup_incomplete_versions(dry_run=False)
+    check("空壳被清理掉", not os.path.isdir(sdir))
+
+    # 目录里有文件但没 json（下了一半取消）
+    half = "1.97.7-half"
+    hdir = os.path.join(mcget.GAME_DIR, "versions", half)
+    os.makedirs(hdir, exist_ok=True)
+    with open(os.path.join(hdir, f"{half}.jar"), "wb") as f:
+        f.write(b"partial")
+    found4 = mcget.find_incomplete_versions()
+    check("没 json 但有残留文件的目录被识别",
+          any(n == half and "残留文件" in r for n, r in found4), f"实际 {found4}")
+    mcget.cleanup_incomplete_versions(dry_run=False)
+    check("有残留文件的目录也被清理", not os.path.isdir(hdir))
 
     shutil.rmtree(tmp2, ignore_errors=True)
     mcget.GAME_DIR = old_dir

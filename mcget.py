@@ -248,7 +248,10 @@ def fetch(url: str, dest: str, expect_sha1: str = None, label: str = None, size:
         except OSError:
             pass
 
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    # 注意：这里刻意不提前建目录。
+    # 以前是开工就 makedirs，结果一取消就留下一个空的 versions/<id>/ 空壳，
+    # 启动器里看不到版本、资源管理器里却多一堆文件夹。
+    # 现在改成「确认要写盘时才建目录」，取消/失败就一个目录都不会留下。
     _emit({"type": "file_start", "label": name, "size": size or 0})
 
     for attempt in range(3):
@@ -278,8 +281,7 @@ def fetch(url: str, dest: str, expect_sha1: str = None, label: str = None, size:
                 if actual != expect_sha1.lower():
                     raise ValueError(f"SHA1 不匹配 期望={expect_sha1} 实际={actual}")
 
-            with open(dest, "wb") as f:
-                f.write(data)
+            atomic_write(dest, data)
 
             stat["downloaded"] += 1
             _emit({"type": "file_done", "label": name, "size": len(data),
@@ -294,16 +296,76 @@ def fetch(url: str, dest: str, expect_sha1: str = None, label: str = None, size:
                 stat["failed"] += 1
                 _emit({"type": "file_done", "label": name, "size": 0,
                        "ok": False, "skipped": False})
-                # 清理可能的残缺文件
-                if os.path.isfile(dest) and os.path.getsize(dest) == 0:
-                    try:
-                        os.remove(dest)
-                    except OSError:
-                        pass
                 return False
             time.sleep(1.0)
 
     return False
+
+
+def atomic_write(dest: str, data: bytes):
+    """
+    原子写盘：先写到 <dest>.part，写完整了再 os.replace 成正式名字。
+
+    为什么非要绕这一步：直接 open(dest,"wb") 写的话，写盘途中进程被强杀
+    （关窗口、任务管理器结束进程、断电），磁盘上就会留下一个**文件名正确、
+    内容却只有一半**的文件。启动器和 mcget 自己都会把它当成完整文件看待。
+
+    用 .part 中转后，同样的中断只会留下一个 .part 垃圾 ——
+    不会被任何东西误认成正式文件，下次下载直接覆盖它。
+
+    os.replace 在同一分区内是原子操作（要么看到旧文件，要么看到新文件，
+    不存在中间态），而且它会覆盖已存在的目标文件，Windows / Linux 上都可用。
+
+    正常失败（异常）时这里会主动删掉 .part，不留垃圾；
+    只有进程被强杀、Python 来不及执行清理时才会残留，那种情况由 clean 收拾。
+    """
+    tmp = dest + ".part"
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def find_part_files():
+    """
+    找出所有 .part 残留 —— 也就是「写盘写到一半进程没了」留下的半成品。
+    返回绝对路径列表。
+    """
+    parts = []
+    for sub in ("versions", "libraries", "assets", "installers"):
+        base = os.path.join(GAME_DIR, sub)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in files:
+                if fn.endswith(".part"):
+                    parts.append(os.path.join(dirpath, fn))
+    return parts
+
+
+def cleanup_part_files(dry_run: bool = False):
+    """删掉 .part 残留。返回 (删掉的数量, 路径列表)"""
+    parts = find_part_files()
+    if not parts:
+        return 0, []
+    removed = 0
+    for p in parts:
+        if dry_run:
+            continue
+        try:
+            os.remove(p)
+            removed += 1
+        except OSError as e:
+            log(f"    [警告] 删不掉 {p} : {e}")
+    return removed, parts
 
 
 def fetch_many(tasks):
@@ -679,10 +741,12 @@ def cmd_download(args):
     #    中途取消或崩溃就会留下一个能看见、却打不开的残缺版本。
     #    放到最后写，没下完就根本不会出现这个版本，也不会有残留可清。
     if is_cancelled():
+        remove_empty_version_dir(version_id)
         log("已取消。已经下好的文件都留着，重新运行即可接着下")
         return 1
 
     if stat["failed"]:
+        remove_empty_version_dir(version_id)
         log(f"有 {stat['failed']} 个文件失败，重新运行同一条命令即可续传")
         return 1
 
@@ -893,11 +957,12 @@ def vanilla_version_exists(mc: str) -> bool:
 
 def find_incomplete_versions():
     """
-    扫描 versions/ 找出「看得见但打不开」的版本。
+    扫描 versions/ 找出残缺的版本目录。
 
     判定标准（满足任一即算残缺）：
-      1. json 里声明了 client jar，但那个 jar 不存在
-      2. 有 inheritsFrom（Fabric/Quilt），但被继承的原版不在了
+      1. 目录里根本没有 <id>.json —— 下载中途取消留下的空壳
+      2. json 里声明了 client jar，但那个 jar 不存在
+      3. 有 inheritsFrom（Fabric/Quilt），但被继承的原版不在了
 
     返回 [(version_id, 原因), ...]
     """
@@ -908,9 +973,21 @@ def find_incomplete_versions():
     bad = []
     for name in sorted(os.listdir(root)):
         vdir = os.path.join(root, name)
-        vjson = os.path.join(vdir, f"{name}.json")
-        if not os.path.isfile(vjson):
+        if not os.path.isdir(vdir):
             continue
+
+        vjson = os.path.join(vdir, f"{name}.json")
+
+        # 情况 1：连 json 都没有 —— 取消留下的空壳，启动器根本认不出它
+        if not os.path.isfile(vjson):
+            try:
+                has_file = any(os.path.isfile(os.path.join(vdir, x))
+                               for x in os.listdir(vdir))
+            except OSError:
+                has_file = True
+            bad.append((name, "没下载完（有残留文件）" if has_file else "没下载完（空目录）"))
+            continue
+
         try:
             with open(vjson, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -932,6 +1009,24 @@ def find_incomplete_versions():
         if inherits and not vanilla_version_exists(inherits):
             bad.append((name, f"缺原版 {inherits}"))
     return bad
+
+
+def remove_empty_version_dir(version_id: str) -> bool:
+    """
+    兜底清理：如果 versions/<id>/ 里一个文件都没有，就把它删掉。
+    只在目录为空时动手，所以永远不会删掉任何已下载的内容。
+    返回是否删掉了。
+    """
+    vdir = os.path.join(GAME_DIR, "versions", version_id)
+    if not os.path.isdir(vdir):
+        return False
+    try:
+        if any(os.path.isfile(os.path.join(vdir, x)) for x in os.listdir(vdir)):
+            return False                 # 里面有东西，不动
+        os.rmdir(vdir)
+        return True
+    except OSError:
+        return False
 
 
 def cleanup_incomplete_versions(dry_run: bool = False):
@@ -963,17 +1058,31 @@ def cleanup_incomplete_versions(dry_run: bool = False):
 def cmd_clean(args):
     dry = bool(getattr(args, "dry_run", False))
     bad = find_incomplete_versions()
-    if not bad:
+    parts = find_part_files()
+
+    if not bad and not parts:
         log("没有残缺版本，目录是干净的")
         return 0
-    log(f"发现 {len(bad)} 个残缺版本：")
-    for name, reason in bad:
-        log(f"    {name}  —— {reason}")
+
+    if bad:
+        log(f"发现 {len(bad)} 个残缺版本：")
+        for name, reason in bad:
+            log(f"    {name}  —— {reason}")
+    if parts:
+        log(f"\n发现 {len(parts)} 个没写完的半成品（.part）：")
+        for p in parts[:10]:
+            log(f"    {os.path.relpath(p, GAME_DIR)}")
+        if len(parts) > 10:
+            log(f"    …… 还有 {len(parts) - 10} 个")
+
     if dry:
         log("\n（--dry-run 只查看，没删。去掉这个参数就会真的清理）")
         return 0
+
     removed, _ = cleanup_incomplete_versions(dry_run=False)
-    log(f"\n已清理 {removed} 个。重新下载对应版本即可恢复正常")
+    removed_parts, _ = cleanup_part_files(dry_run=False)
+    log(f"\n已清理 {removed} 个残缺版本、{removed_parts} 个半成品。"
+        f"重新下载对应版本即可恢复正常")
     return 0
 
 
@@ -1057,10 +1166,12 @@ def install_mod_loader(kind: str, mc: str, loader: str = None,
     #    json 是启动器认出这个版本的唯一凭据，提前写 + 中途取消
     #    = 启动器里出现一个打不开的残缺版本。所以放在最后。
     if is_cancelled():
+        remove_empty_version_dir(version_id)
         log(f"[已取消] {label} {version_id} 没装完，没有生成版本文件")
         return False
     new_failed = stat["failed"] - failed_at_start
     if new_failed:
+        remove_empty_version_dir(version_id)
         log(f"[未完成] 有 {new_failed} 个库没下成，暂不生成版本文件，重跑一次即可")
         return False
 
