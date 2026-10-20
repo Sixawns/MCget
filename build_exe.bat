@@ -67,6 +67,33 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem ---------- 2.6 旧 exe 还开着的话先关掉 ----------
+rem 正在运行的 exe 会被系统锁住，PyInstaller 覆盖它时会报
+rem "PermissionError: [WinError 5] 拒绝访问"。这里提前试删一次，
+rem 删不掉就说明它还开着 —— 早点告诉用户，免得等几分钟后才炸。
+set "LOCKED=0"
+for %%N in ("dist\mcget.exe" "dist\mcget-cli.exe") do (
+    if exist %%~N (
+        del /f /q %%~N >nul 2>&1
+        if exist %%~N set "LOCKED=%%~N"
+    )
+)
+if not "%LOCKED%"=="0" (
+    echo [错误] %LOCKED% 删不掉，说明它正在运行。
+    echo.
+    echo        请关掉正在运行的 mcget 窗口再重新跑这个脚本。
+    echo        （关了还不行的话，任务管理器里结束掉残留的 mcget.exe 进程。）
+    echo.
+    tasklist /fi "imagename eq mcget.exe" 2>nul | find /i "mcget.exe" >nul
+    if not errorlevel 1 (
+        echo        现在确实有一个 mcget.exe 在跑：
+        tasklist /fi "imagename eq mcget.exe" 2>nul | find /i "mcget.exe"
+        echo.
+    )
+    pause
+    exit /b 1
+)
+
 rem ---------- 3. 打包图形界面版 ----------
 echo [3/5] 打包图形界面版 (这一步要 1~3 分钟) ...
 pyinstaller --noconfirm --clean mcget_gui.spec

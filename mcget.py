@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -648,9 +649,6 @@ def cmd_download(args):
         return 1
 
     vjson_path = os.path.join(GAME_DIR, "versions", version_id, f"{version_id}.json")
-    os.makedirs(os.path.dirname(vjson_path), exist_ok=True)
-    with open(vjson_path, "w", encoding="utf-8") as f:
-        json.dump(version, f)
 
     # 3) 先把全部要下的东西收齐，这样进度条一开始就有总量
     _emit({"type": "phase", "name": "收集文件清单"})
@@ -675,15 +673,26 @@ def cmd_download(args):
 
     log("\n========== 完成 ==========")
     log(f"新下载: {stat['downloaded']}    跳过(已存在): {stat['skipped']}    失败: {stat['failed']}")
+
+    # 6) 版本 json 最后才写。
+    #    它是启动器「认出这个版本」的唯一凭据 —— 提前写的话，
+    #    中途取消或崩溃就会留下一个能看见、却打不开的残缺版本。
+    #    放到最后写，没下完就根本不会出现这个版本，也不会有残留可清。
     if is_cancelled():
         log("已取消。已经下好的文件都留着，重新运行即可接着下")
         return 1
-    if stat["failed"] == 0:
-        log(f"版本 {version_id} 已完整下载到 {os.path.abspath(GAME_DIR)}")
-        log("提示: 本工具只负责下载，启动请用 PCL / HMCL 等启动器")
-    else:
+
+    if stat["failed"]:
         log(f"有 {stat['failed']} 个文件失败，重新运行同一条命令即可续传")
-    return 0 if stat["failed"] == 0 else 1
+        return 1
+
+    os.makedirs(os.path.dirname(vjson_path), exist_ok=True)
+    with open(vjson_path, "w", encoding="utf-8") as f:
+        json.dump(version, f)
+
+    log(f"版本 {version_id} 已完整下载到 {os.path.abspath(GAME_DIR)}")
+    log("提示: 本工具只负责下载，启动请用 PCL / HMCL 等启动器")
+    return 0
 
 
 # ============================================================
@@ -873,6 +882,101 @@ def vanilla_version_exists(mc: str) -> bool:
     return os.path.isfile(os.path.join(GAME_DIR, "versions", mc, f"{mc}.json"))
 
 
+# ============================================================
+# 清理残缺版本
+# ============================================================
+#
+# 启动器靠 versions/<id>/<id>.json 认出版本。只要有 json，
+# 哪怕里面的 jar 根本没下完，列表里也会显示出来 —— 点了才发现打不开。
+# 现在的代码是「全下完才写 json」，但更早的版本是提前写的，
+# 所以老用户目录里可能已经留着这种残缺版本。下面这组函数用来清掉它们。
+
+def find_incomplete_versions():
+    """
+    扫描 versions/ 找出「看得见但打不开」的版本。
+
+    判定标准（满足任一即算残缺）：
+      1. json 里声明了 client jar，但那个 jar 不存在
+      2. 有 inheritsFrom（Fabric/Quilt），但被继承的原版不在了
+
+    返回 [(version_id, 原因), ...]
+    """
+    root = os.path.join(GAME_DIR, "versions")
+    if not os.path.isdir(root):
+        return []
+
+    bad = []
+    for name in sorted(os.listdir(root)):
+        vdir = os.path.join(root, name)
+        vjson = os.path.join(vdir, f"{name}.json")
+        if not os.path.isfile(vjson):
+            continue
+        try:
+            with open(vjson, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        client = (data.get("downloads") or {}).get("client") or {}
+        jar_name = client.get("id") or name      # 有的 json 用 id 指定 jar 名
+        jar_path = os.path.join(vdir, f"{jar_name}.jar")
+        if client.get("url") and not os.path.isfile(jar_path):
+            # Fabric/Quilt 这类靠继承的版本本来就没有自己的 jar，不算残缺
+            if not data.get("inheritsFrom"):
+                bad.append((name, "缺主 jar"))
+                continue
+
+        inherits = data.get("inheritsFrom")
+        if inherits and not vanilla_version_exists(inherits):
+            bad.append((name, f"缺原版 {inherits}"))
+    return bad
+
+
+def cleanup_incomplete_versions(dry_run: bool = False):
+    """
+    删掉残缺版本的目录。
+
+    dry_run=True 时只列出不删。
+    返回 (清理掉的数量, 说明文本列表)
+    """
+    bad = find_incomplete_versions()
+    if not bad:
+        return 0, []
+
+    notes = []
+    removed = 0
+    for name, reason in bad:
+        vdir = os.path.join(GAME_DIR, "versions", name)
+        notes.append(f"{name}（{reason}）")
+        if dry_run:
+            continue
+        try:
+            shutil.rmtree(vdir)
+            removed += 1
+        except Exception as e:
+            log(f"    [警告] 删不掉 {vdir} : {e}")
+    return removed, notes
+
+
+def cmd_clean(args):
+    dry = bool(getattr(args, "dry_run", False))
+    bad = find_incomplete_versions()
+    if not bad:
+        log("没有残缺版本，目录是干净的")
+        return 0
+    log(f"发现 {len(bad)} 个残缺版本：")
+    for name, reason in bad:
+        log(f"    {name}  —— {reason}")
+    if dry:
+        log("\n（--dry-run 只查看，没删。去掉这个参数就会真的清理）")
+        return 0
+    removed, _ = cleanup_incomplete_versions(dry_run=False)
+    log(f"\n已清理 {removed} 个。重新下载对应版本即可恢复正常")
+    return 0
+
+
 def install_mod_loader(kind: str, mc: str, loader: str = None,
                        auto_vanilla: bool = False) -> bool:
     """
@@ -885,6 +989,10 @@ def install_mod_loader(kind: str, mc: str, loader: str = None,
     """
     kind = kind.lower()
     label = "Fabric" if kind == "fabric" else "Quilt"
+
+    # 记下起始的失败数：stat 是全局的，不这么做的话，
+    # 上一轮留下的失败数会让这次被误判为失败
+    failed_at_start = stat["failed"]
 
     # 1) 决定用哪个 loader 版本
     if loader:
@@ -931,15 +1039,9 @@ def install_mod_loader(kind: str, mc: str, loader: str = None,
             log(f"      请先下载原版 {inherits}（主界面选它下载一次即可），")
             log(f"      或者勾上「顺带下载缺失的原版」再来一次")
 
-    # 4) 写 version json —— 启动器靠它认出这个版本
+    # 4) 下载库
     vdir = os.path.join(GAME_DIR, "versions", version_id)
-    os.makedirs(vdir, exist_ok=True)
     vjson = os.path.join(vdir, f"{version_id}.json")
-    with open(vjson, "w", encoding="utf-8") as f:
-        json.dump(profile, f)
-    log(f"      版本文件 -> {vjson}")
-
-    # 5) 下载库
     tasks = collect_profile_libraries(profile)
     log(f"      共 {len(tasks)} 个库文件")
     if tasks:
@@ -948,15 +1050,27 @@ def install_mod_loader(kind: str, mc: str, loader: str = None,
         _emit({"type": "phase", "name": f"下载 {label} 库"})
         fetch_many(tasks)
 
-    if stat["failed"]:
-        log(f"[完成] {version_id} 已写入，但有 {stat['failed']} 个库没下成，重跑一次即可补齐")
+    _emit({"type": "phase", "name": "完成"})
+    _emit({"type": "done"})
+
+    # 5) 库全下齐了才写 version json。
+    #    json 是启动器认出这个版本的唯一凭据，提前写 + 中途取消
+    #    = 启动器里出现一个打不开的残缺版本。所以放在最后。
+    if is_cancelled():
+        log(f"[已取消] {label} {version_id} 没装完，没有生成版本文件")
+        return False
+    new_failed = stat["failed"] - failed_at_start
+    if new_failed:
+        log(f"[未完成] 有 {new_failed} 个库没下成，暂不生成版本文件，重跑一次即可")
         return False
 
+    os.makedirs(vdir, exist_ok=True)
+    with open(vjson, "w", encoding="utf-8") as f:
+        json.dump(profile, f)
+    log(f"      版本文件 -> {vjson}")
     log(f"[完成] {label} 版本 {version_id} 已就绪")
     if inherits:
         log(f"      依赖原版 {inherits}，启动器里选 {version_id} 就能玩")
-    _emit({"type": "phase", "name": "完成"})
-    _emit({"type": "done"})
     return True
 
 
@@ -1033,6 +1147,11 @@ def build_parser():
 
     sub.add_parser("list", parents=[common], help="列出所有正式版")
 
+    p_clean = sub.add_parser("clean", parents=[common],
+                             help="清理残缺版本（看得见但打不开的那种）")
+    p_clean.add_argument("--dry-run", action="store_true",
+                         help="只列出来看看，不真删")
+
     p_dl = sub.add_parser("download", parents=[common], help="下载指定版本")
     p_dl.add_argument("version", help="MC 版本号，如 1.20.1")
     p_dl.add_argument("--extract-natives", action="store_true",
@@ -1082,6 +1201,7 @@ def main(argv=None):
     handlers = {
         "list": cmd_list,
         "download": cmd_download,
+        "clean": cmd_clean,
         "forge": cmd_forge,
         "neoforge": cmd_neoforge,
         "fabric": cmd_fabric,

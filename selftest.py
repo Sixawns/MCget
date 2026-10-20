@@ -468,6 +468,70 @@ def main():
     check("原版已存在时不重复下载", mcget.vanilla_version_exists(VERSION_ID) is True)
     check("不存在的原版能被正确判定为缺失", mcget.vanilla_version_exists("9.9.9") is False)
 
+    print("\n=== 取消后不留残缺版本（用户反馈的那个问题）===")
+    # 关键：version json 是启动器认出版本的唯一凭据。
+    # 只要它先落盘、下载再被取消，启动器里就会出现一个「看得见但打不开」的版本。
+    mcget.OFFICIAL_MANIFEST = base + "manifest.json"
+    mcget.OFFICIAL_LIB = base + "lib/"
+    mcget.OFFICIAL_ASSET = base + "assets/"
+    mcget.USE_MIRROR = False
+    mcget.reset_cancel()
+
+    # 造一个干净目录，故意先下到一半再取消
+    tmp2 = tempfile.mkdtemp(prefix="mcget_cancel_")
+    old_dir = mcget.GAME_DIR
+    mcget.GAME_DIR = os.path.join(tmp2, ".minecraft")
+
+    mcget.request_cancel()          # 一开始就取消 -> 一个文件都下不成
+    mcget.stat.update({"downloaded": 0, "skipped": 0, "failed": 0})
+    run_download()
+    vdir = os.path.join(mcget.GAME_DIR, "versions", VERSION_ID)
+    check("取消后没有生成 version json",
+          not os.path.isfile(os.path.join(vdir, f"{VERSION_ID}.json")))
+    mcget.reset_cancel()
+
+    # 正常下完后 json 应该出现
+    mcget.stat.update({"downloaded": 0, "skipped": 0, "failed": 0})
+    run_download()
+    check("完整下载后 version json 才出现",
+          os.path.isfile(os.path.join(vdir, f"{VERSION_ID}.json")))
+
+    print("\n=== 清理残缺版本 ===")
+    # 手工造一个「有 json 但没 jar」的残缺版本，模拟老版本留下的烂摊子
+    broken = "1.99.9-broken"
+    bdir = os.path.join(mcget.GAME_DIR, "versions", broken)
+    os.makedirs(bdir, exist_ok=True)
+    with open(os.path.join(bdir, f"{broken}.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": broken, "downloads": {"client": {"url": base + "client.jar"}}}, f)
+
+    found = mcget.find_incomplete_versions()
+    names = [n for n, _ in found]
+    check("缺主 jar 的版本被识别为残缺", broken in names, f"实际 {found}")
+    check("完整的版本不会被误判", VERSION_ID not in names, f"实际 {found}")
+
+    dry, notes = mcget.cleanup_incomplete_versions(dry_run=True)
+    check("--dry-run 不真删", dry == 0 and os.path.isdir(bdir))
+
+    removed, _ = mcget.cleanup_incomplete_versions(dry_run=False)
+    check("真的清理掉了", removed == 1 and not os.path.isdir(bdir))
+
+    # 再清一次应当什么都不报
+    check("清理后再扫描是干净的", mcget.find_incomplete_versions() == [])
+
+    # 缺依赖原版的 Fabric 版本也要能被识别
+    fab = "fabric-loader-0.1-1.99.9"
+    fdir = os.path.join(mcget.GAME_DIR, "versions", fab)
+    os.makedirs(fdir, exist_ok=True)
+    with open(os.path.join(fdir, f"{fab}.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": fab, "inheritsFrom": "1.99.9-notexist"}, f)
+    found2 = mcget.find_incomplete_versions()
+    check("缺依赖原版的加载器版本被识别",
+          any(n == fab for n, _ in found2), f"实际 {found2}")
+    mcget.cleanup_incomplete_versions(dry_run=False)
+
+    shutil.rmtree(tmp2, ignore_errors=True)
+    mcget.GAME_DIR = old_dir
+
     print("\n=== 图形界面静态检查（跑不了 Tk，至少保证不会一打开就报错）===")
     gui_path = os.path.join(HERE, "mcget_gui.py")
     if not os.path.isfile(gui_path):

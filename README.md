@@ -1,4 +1,3 @@
-![演示](images/demo.png)
 # mcget
 
 一个 Minecraft 游戏文件下载器。把某个版本的完整文件拉到本地，交给 PCL / HMCL 启动。
@@ -24,6 +23,9 @@ python mcget.py fabric 1.20.1                 # Fabric，版本留空 = 最新�
 python mcget.py quilt  1.20.1
 python mcget.py forge  1.20.1 47.4.13         # Forge 必须指定版本
 python mcget.py neoforge 1.21.1
+
+python mcget.py clean --dry-run       # 看看有没有残缺版本（不删）
+python mcget.py clean                 # 真删
 ```
 
 命令行下也会显示实时进度：
@@ -49,6 +51,7 @@ python mcget_gui.py
 | 同时下载 | 同时下几个文件，16 左右比较稳 |
 | 加载器 | Fabric / Quilt / Forge / NeoForge 四选一 |
 | 进度 | 百分比、已下/总量、实时速度、剩余时间 |
+| 清理残缺版本 | 删掉「启动器里看得见、点进去打不开」的版本 |
 | 停止 | 随时打断，下好的文件留着，再点一次接着下 |
 
 MC 版本和加载器版本都**留空就自动选最新的**，不用查版本号。
@@ -73,8 +76,16 @@ pyinstaller --noconfirm --clean mcget_cli.spec
 
 想换图标，放一个 `icon.ico` 在项目目录，spec 会自动用上。
 
-> 别用裸命令 `pyinstaller -F -w mcget_gui.py`。customtkinter 没有官方 hook，
-> 主题 json 和字体会漏掉，打出来的 exe 双击直接崩。走 spec 才对。
+> 别用裸命令 `pyinstaller -F -w mcget_gui.py`。较新版本的 hooks-contrib 虽然带了
+> customtkinter 的 hook，但早先没有，主题 json 和字体可能被漏掉、导致 exe 双击直接崩。
+> spec 里的 `collect_data_files("customtkinter")` 就是防这个的，走 spec 更稳。
+
+#### 常见报错
+
+**`PermissionError: [WinError 5] 拒绝访问: dist\mcget.exe`**
+旧 exe 正在运行，被系统锁住了，覆盖不了。
+关掉 mcget 窗口（或任务管理器结束残留进程）再跑。
+`build_exe.bat` 会在打包前自动检查并提示这个。
 
 ---
 
@@ -149,6 +160,21 @@ Fabric/Quilt 的 meta 服务直接给 launcher profile（自带库清单和 `mai
 
 **为什么不用 tqdm**
 标准库就能在终端刷同一行，不值得为一个进度条多一个依赖。
+
+**为什么取消后不会留下残缺版本**
+`versions/<id>/<id>.json` 是启动器认出某个版本的**唯一凭据**。
+如果它先落盘、下载再被取消，启动器列表里就会出现一个看得见、点进去却打不开的版本。
+
+所以两个下载入口都把写 json 放在**全部下完之后**：
+
+- `cmd_download()` —— 客户端 jar、库、资源全部成功才写
+- `install_mod_loader()` —— 库全部下齐才写
+
+没下完就根本不会有这个版本，中途取消、关窗口、程序崩掉都一样。
+已经下好的文件仍然留着，重跑会接着下（靠 SHA1 跳过）。
+
+老版本是提前写 json 的，所以旧目录里可能已经留着这种残缺版本，
+用界面上的「清理残缺版本」或命令行 `mcget.py clean` 清掉即可。
 
 ---
 

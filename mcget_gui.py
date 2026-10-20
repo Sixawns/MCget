@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 try:
     import customtkinter as ctk
+    from tkinter import messagebox
 except ModuleNotFoundError as _e:
     sys.stderr.write(
         "缺少依赖：%s\n"
@@ -218,19 +219,27 @@ class App(ctk.CTk):
         # ---------- 6. 按钮 ----------
         f5 = ctk.CTkFrame(self, fg_color="transparent")
         f5.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 6))
-        f5.grid_columnconfigure(4, weight=1)   # 右侧留白，按钮靠左排
+        f5.grid_columnconfigure(5, weight=1)   # 右侧留白，按钮靠左排
 
         self.btn_start = ctk.CTkButton(
             f5, text="开始下载", width=120, height=34, command=self._start)
         self.btn_start.grid(row=0, column=0, padx=(0, 6))
         self.btn_stop = ctk.CTkButton(
             f5, text="停止", width=90, height=34, state="disabled",
-            fg_color="#8a3b3b", hover_color="#a34a4a", command=self._stop)
+            fg_color=("#d9534f", "#8a3b3b"), hover_color=("#c9302c", "#a34a4a"),
+            command=self._stop)
         self.btn_stop.grid(row=0, column=1, padx=6)
         ctk.CTkButton(f5, text="打开目录", width=90, height=34,
                       command=self._open_dir).grid(row=0, column=2, padx=6)
+        self.btn_clean = ctk.CTkButton(
+            f5, text="清理残缺版本", width=110, height=34,
+            fg_color="transparent", border_width=1,
+            text_color=("gray10", "gray90"), command=self._do_clean)
+        self.btn_clean.grid(row=0, column=3, padx=6)
         ctk.CTkButton(f5, text="清空日志", width=90, height=34,
-                      command=self._clear_log).grid(row=0, column=3, padx=6)
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"),
+                      command=self._clear_log).grid(row=0, column=4, padx=6)
 
         # ---------- 7. 底部说明行 ----------
         self.lbl_hint = ctk.CTkLabel(
@@ -384,9 +393,54 @@ class App(ctk.CTk):
     def _stop(self):
         if not self.busy:
             return
-        self._log("[停止] 正在收尾，已下好的文件会保留 …")
+        self._log("[停止] 正在收尾 …")
+        self._log("      下好的文件会留着，下次接着下；没下完的版本不会出现在启动器里")
         mcget.request_cancel()
         self.btn_stop.configure(state="disabled")
+
+    def _do_clean(self):
+        """清理「启动器里看得见、点进去打不开」的残缺版本"""
+        if self.busy:
+            return
+        self._apply_settings()
+        self.btn_clean.configure(state="disabled")
+        self._log("正在扫描残缺版本 …")
+
+        def work():
+            try:
+                found = mcget.find_incomplete_versions()
+            except Exception as e:
+                self.q.put({"type": "log", "text": f"[异常] {e}"})
+                found = []
+            self.q.put({"type": "clean_found", "found": found})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_clean_found(self, found):
+        self.btn_clean.configure(state="normal")
+        if not found:
+            self._log("      没有残缺版本，目录是干净的")
+            return
+
+        self._log(f"      发现 {len(found)} 个残缺版本：")
+        for name, reason in found:
+            self._log(f"        {name}  —— {reason}")
+
+        # 弹窗确认再删，避免误伤
+        listing = "\n".join(f"  · {n}（{r}）" for n, r in found[:12])
+        if len(found) > 12:
+            listing += f"\n  …… 还有 {len(found) - 12} 个"
+        ok = messagebox.askyesno(
+            "清理残缺版本",
+            f"要删掉这 {len(found)} 个残缺版本吗？\n\n{listing}\n\n"
+            f"这些都是缺了主文件或依赖原版的版本，删掉不影响其他版本。\n"
+            f"要恢复的话重新下载一次即可。")
+        if not ok:
+            self._log("      已取消，没有删除任何东西")
+            return
+
+        removed, _ = mcget.cleanup_incomplete_versions(dry_run=False)
+        self._log(f"      已清理 {removed} 个残缺版本")
 
     # ---- 统一后的加载器入口 ----
 
@@ -510,6 +564,8 @@ class App(ctk.CTk):
             self._on_versions(item.get("ids"), item.get("current", ""))
         elif t == "loader_list":
             self._on_loader_list(item.get("kind"), item.get("mc"), item.get("versions"))
+        elif t == "clean_found":
+            self._on_clean_found(item.get("found") or [])
         elif t == "finished":
             self._on_finished(item.get("rc", 0))
         # "tick" 不需要处理，_poll 里统一刷新
@@ -610,7 +666,7 @@ class App(ctk.CTk):
 
 
 def main():
-    ctk.set_appearance_mode("dark")
+    ctk.set_appearance_mode("light")     # 浅色主题
     ctk.set_default_color_theme("blue")
     App().mainloop()
 
