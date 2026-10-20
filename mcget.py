@@ -16,6 +16,9 @@ mcget —— Minecraft 版本下载器（自用 / 纯下载，不含启动功能
     python mcget.py fabric 1.20.1 0.15.11
     python mcget.py quilt 1.20.1               # Quilt 同理
 
+    python mcget.py clean                      # 清理没下完的版本和 .part 半成品
+    python mcget.py clean --dry-run            # 只看看，不真删
+
 图形界面用法（需 pip install customtkinter）：
     python mcget_gui.py
 

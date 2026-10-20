@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mcget_gui.py —— mcget 的图形界面（CustomTkinter 暗黑风）
+mcget_gui.py —— mcget 的图形界面（CustomTkinter，浅色主题）
 
 先装依赖：
     pip install customtkinter
 跑起来：
     python mcget_gui.py
-打包成 exe（做完这一步用户就不用装 Python 了）：
-    pyinstaller -F -w mcget_gui.py
+
+打包成 exe：走 mcget_gui.spec，别用裸命令
+    pyinstaller --noconfirm --clean mcget_gui.spec
+（customtkinter 的主题 json 和字体不会被自动收进包里，
+ spec 里的 collect_data_files 就是补这个的，裸命令打出来的 exe 会闪退）
 
 线程模型（很重要，改代码时别破坏它）：
     mcget 的下载跑在「工作线程」里，它抛出来的日志和进度事件先进 queue.Queue；
