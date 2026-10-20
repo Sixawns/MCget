@@ -1,3 +1,4 @@
+![演示](images/demo.png)
 # mcget
 
 一个 Minecraft 游戏文件下载器。把某个版本的完整文件拉到本地，交给 PCL / HMCL 启动。
